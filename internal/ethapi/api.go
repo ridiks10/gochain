@@ -36,6 +36,7 @@ import (
 	"github.com/gochain-io/gochain/common/hexutil"
 	"github.com/gochain-io/gochain/common/math"
 	"github.com/gochain-io/gochain/consensus/clique"
+	"github.com/gochain-io/gochain/contracts/delegator"
 	"github.com/gochain-io/gochain/core"
 	"github.com/gochain-io/gochain/core/rawdb"
 	"github.com/gochain-io/gochain/core/types"
@@ -1244,7 +1245,6 @@ func submitTransaction(ctx context.Context, b Backend, tx *types.Transaction) (c
 // SendTransaction creates a transaction for the given argument, sign it and submit it to the
 // transaction pool.
 func (s *PublicTransactionPoolAPI) SendTransaction(ctx context.Context, args SendTxArgs) (common.Hash, error) {
-
 	// Look up the wallet containing the requested signer
 	account := accounts.Account{Address: args.From}
 
@@ -1276,7 +1276,68 @@ func (s *PublicTransactionPoolAPI) SendTransaction(ctx context.Context, args Sen
 	if err != nil {
 		return common.Hash{}, err
 	}
-	return submitTransaction(ctx, s.b, signed)
+
+	eventCh := make(chan core.ChainEvent, 0)
+	s.b.SubscribeChainEvent(eventCh, "ethapi")
+	defer s.b.UnsubscribeChainEvent(eventCh)
+
+	// Submit original transaction.
+	// Exit immediately if it is not contract creation.
+	txHash, err := submitTransaction(ctx, s.b, signed)
+	if err != nil {
+		return common.Hash{}, err
+	} else if signed.To() != nil {
+		return txHash, nil
+	}
+
+	// Wait for the original contract's address.
+	contractAddr, err := waitForContractAddress(ctx, eventCh, s.b.ChainDb(), txHash)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	println("dbg/tx", contractAddr.String())
+
+	// Create delegation storage contract.
+	var storageAddr common.Address
+	storageTx, err := wallet.SignTx(ctx, account, types.NewContractCreation(signed.Nonce()+1, new(big.Int), uint64(*args.Gas), (*big.Int)(args.GasPrice), delegator.StorageCode()), chainID)
+	if err != nil {
+		return common.Hash{}, err
+	} else if storageHash, err := submitTransaction(ctx, s.b, storageTx); err != nil {
+		return common.Hash{}, err
+	} else if storageAddr, err = waitForContractAddress(ctx, eventCh, s.b.ChainDb(), storageHash); err != nil {
+		return common.Hash{}, err
+	}
+	println("dbg/storage", storageAddr.String())
+
+	// Create delegator contract.
+	var delegatorHash common.Hash
+	var delegatorAddr common.Address
+	delegatorCode := delegator.DelegatorCode(storageAddr, contractAddr)
+	fmt.Printf("dbg/code %x\n", delegatorCode)
+	delegatorTx, err := wallet.SignTx(ctx, account, types.NewContractCreation(storageTx.Nonce()+1, new(big.Int), uint64(*args.Gas), (*big.Int)(args.GasPrice), delegatorCode), chainID)
+	if err != nil {
+		return common.Hash{}, err
+	} else if delegatorHash, err = submitTransaction(ctx, s.b, delegatorTx); err != nil {
+		return common.Hash{}, err
+	} else if delegatorAddr, err = waitForContractAddress(ctx, eventCh, s.b.ChainDb(), delegatorHash); err != nil {
+		return common.Hash{}, err
+	}
+	println("dbg/delegator", delegatorAddr.String())
+
+	return delegatorHash, nil
+}
+
+func waitForContractAddress(ctx context.Context, eventCh chan core.ChainEvent, chaindb common.Database, hash common.Hash) (common.Address, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return common.Address{}, ctx.Err()
+		case <-eventCh:
+			if receipt, _, _, _ := rawdb.ReadReceipt(chaindb, hash); receipt != nil {
+				return receipt.ContractAddress, nil
+			}
+		}
+	}
 }
 
 // SendRawTransaction will add the signed transaction to the transaction pool.
